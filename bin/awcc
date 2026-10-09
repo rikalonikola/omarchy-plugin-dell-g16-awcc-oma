@@ -1,0 +1,774 @@
+#!/usr/bin/env python3
+"""awcc - Alienware Command Center alternative for the Dell G16 on Linux (Dell G16 AWCC-Oma).
+
+Built and verified on a Dell G16 7630; every write to the hardware first checks the model (see `awcc doctor`). Talks to:
+  * the kernel's alienware-wmi / dell-pc drivers (thermal profiles, fans, sensors)
+  * the AW-ELC USB HID controller (187c:0551, AlienFX API v4) for RGB lighting
+
+Needs the udev rules from udev/70-awcc.rules so no root is required.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+CONFIG_PATH = os.path.expanduser("~/.config/awcc/config.json")
+DEFAULT_CONFIG = {
+    "rgb": {"mode": "static", "color": "#ffffff", "speed": 1500, "brightness": 100, "on": True},
+    "auto": {"enabled": False, "ac": "performance", "battery": "quiet"},
+    "gmode": {"active": False, "previous": None},
+    "profiles": {},      # saved keyboard lighting setups: name -> {mode, color, speed, brightness}
+    "safety": {"allow_unverified": False},   # set with `awcc allow-unverified on` for a G16 revision other than the verified one
+}
+# The G16 7630 keyboard answers to a single lighting zone (id 0); ids 1-3 are rejected.
+KEYBOARD_ZONES = [0]
+RGB_MODES = ["static", "breathe", "spectrum"]
+FAN_BOOST_MAX = 255  # raw value accepted by alienware-wmi fanN_boost
+
+
+# --------------------------------------------------------------------------- config
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    try:
+        with open(CONFIG_PATH) as f:
+            saved = json.load(f)
+        for section, values in saved.items():
+            if isinstance(values, dict) and section in cfg:
+                cfg[section].update(values)
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, CONFIG_PATH)
+
+
+# --------------------------------------------------------------------------- sysfs
+
+def read(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def write(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(str(value))
+    except PermissionError:
+        sys.exit(f"awcc: no permission to write {path} (install udev rules: ./install.sh)")
+    except OSError as e:
+        sys.exit(f"awcc: cannot write {path}: {e.strerror}")
+
+
+def hwmon_dir(name):
+    for d in glob.glob("/sys/class/hwmon/hwmon*"):
+        if read(f"{d}/name") == name:
+            return d
+    return None
+
+
+# --------------------------------------------------------------------------- model guard
+#
+# This package is made for the Dell G16. The kernel interfaces are shared with other G-series / Alienware laptops, but the keyboard
+# controller, the fan layout and the hardware keys are not, and a wrong write can leave the lighting or the fans in a state that is
+# hard to undo. So every write goes through require_supported(): verified model = allowed, other Dell G16 = only after the owner
+# opts in, anything else = sensors only. AWCC_FORCE=1 overrides it for developers (unsupported).
+
+VERIFIED_MODELS = {"Dell G16 7630"}           # lighting, fans, profiles and both hardware keys tested end to end
+G16_RE = re.compile(r"^Dell G16 \d{4}$")
+EXPECTED_FANS = {1: "CPU Fan", 2: "GPU Fan"}  # alienware_wmi hwmon on the G16
+KEY_LIGHT_EVDEV, KEY_G_EVDEV = 188, 701      # F7 "light" key = KEY_F18, G key = evdev 701 (Hyprland keycodes = evdev + 8)
+
+
+def dmi(name):
+    return read(f"/sys/class/dmi/id/{name}", "") or ""
+
+
+def model_info():
+    vendor, name = dmi("sys_vendor"), dmi("product_name")
+    forced = os.environ.get("AWCC_FORCE") == "1"
+    allowed = bool(load_config().get("safety", {}).get("allow_unverified"))
+    if name in VERIFIED_MODELS:
+        return {"name": name, "supported": True, "verified": True, "reason": ""}
+    if vendor.startswith("Dell") and G16_RE.match(name):
+        return {"name": name, "supported": allowed or forced, "verified": False,
+                "reason": f"{name} is a G16 revision this package has not been tested on. Run `awcc doctor`; "
+                          "if everything looks right, allow writes with `awcc allow-unverified on`."}
+    return {"name": name or "unknown", "supported": forced, "verified": False,
+            "reason": f"made for the Dell G16, this machine is '{name or 'unknown'}'. Hardware writes are disabled; sensors still work."}
+
+
+def require_supported(what):
+    m = model_info()
+    if not m["supported"]:
+        sys.exit(f"awcc: {what} refused: {m['reason']}")
+
+
+def fan_layout_ok():
+    hw = hwmon_dir("alienware_wmi")
+    return bool(hw) and all(read(f"{hw}/fan{n}_label") == lbl for n, lbl in EXPECTED_FANS.items())
+
+
+def notify(message):
+    """Short on-screen note; replaces the previous one instead of stacking."""
+    try:
+        subprocess.run(["notify-send", "-a", "awcc", "-t", "1500", "-h", "string:x-canonical-private-synchronous:awcc", message],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    except OSError:
+        pass                                      # no notify-send installed: stay silent
+
+
+# --------------------------------------------------------------------------- thermal
+
+def profile_devices():
+    devs = {}
+    for d in sorted(glob.glob("/sys/class/platform-profile/platform-profile-*")):
+        name = read(f"{d}/name")
+        if name:
+            devs[name] = d
+    return devs
+
+
+# Names unique to one driver map onto the nearest equivalent on the other.
+DELL_PC_ALIASES = {"low-power": "cool", "balanced-performance": "balanced"}
+
+
+def profile_choices():
+    devs = profile_devices()
+    primary = devs.get("alienware-wmi") or next(iter(devs.values()), None)
+    return read(f"{primary}/choices", "").split() if primary else []
+
+
+def get_profile():
+    devs = profile_devices()
+    primary = devs.get("alienware-wmi") or next(iter(devs.values()), None)
+    return read(f"{primary}/profile") if primary else None
+
+
+def set_profile(name):
+    require_supported("changing the thermal profile")
+    devs = profile_devices()
+    if not devs:
+        sys.exit("awcc: no platform profile drivers found")
+    done = False
+    for drv, d in devs.items():
+        choices = read(f"{d}/choices", "").split()
+        wanted = name
+        if drv == "dell-pc":
+            wanted = DELL_PC_ALIASES.get(name, name)
+        if wanted in choices:
+            write(f"{d}/profile", wanted)
+            done = True
+    if not done:
+        sys.exit(f"awcc: unknown profile '{name}' (choices: {' '.join(profile_choices())})")
+
+
+# --------------------------------------------------------------------------- fans
+
+def fan_info():
+    hw = hwmon_dir("alienware_wmi")
+    fans = []
+    if not hw:
+        return fans
+    for n in (1, 2):
+        label = read(f"{hw}/fan{n}_label")
+        if label is None:
+            continue
+        boost = read(f"{hw}/fan{n}_boost")
+        fans.append({
+            "id": n,
+            "label": label,
+            "rpm": int(read(f"{hw}/fan{n}_input", 0) or 0),
+            "max_rpm": int(read(f"{hw}/fan{n}_max", 0) or 0),
+            "boost": round(int(boost) * 100 / FAN_BOOST_MAX) if boost is not None else None,
+        })
+    return fans
+
+
+def set_fan_boost(which, percent):
+    require_supported("changing the fan boost")
+    if os.environ.get("AWCC_FORCE") != "1" and not fan_layout_ok():
+        sys.exit("awcc: fan boost refused: this fan layout differs from the verified G16 (expected CPU Fan + GPU Fan on alienware_wmi)")
+    hw = hwmon_dir("alienware_wmi")
+    if not hw:
+        sys.exit("awcc: alienware_wmi hwmon not found")
+    percent = max(0, min(100, int(percent)))
+    raw = round(percent * FAN_BOOST_MAX / 100)
+    ids = {"cpu": [1], "gpu": [2], "all": [1, 2]}[which]
+    for n in ids:
+        write(f"{hw}/fan{n}_boost", raw)
+
+
+def temps():
+    hw = hwmon_dir("alienware_wmi")
+    out = {}
+    if hw:
+        for n in (1, 2):
+            label = read(f"{hw}/temp{n}_label")
+            val = read(f"{hw}/temp{n}_input")
+            if label and val:
+                out[label.lower()] = round(int(val) / 1000)
+    return out
+
+
+def power_state():
+    ac = None
+    for d in glob.glob("/sys/class/power_supply/*"):
+        if read(f"{d}/type") == "Mains":
+            online = read(f"{d}/online")
+            if online is not None:
+                ac = online == "1"
+                if ac:
+                    break
+    bat = {}
+    for d in glob.glob("/sys/class/power_supply/BAT*"):
+        bat = {"percent": int(read(f"{d}/capacity", 0) or 0), "status": read(f"{d}/status")}
+        break
+    return {"ac": ac, "battery": bat}
+
+
+def status():
+    return {
+        "profile": get_profile(),
+        "profiles": profile_choices(),
+        "temps": temps(),
+        "fans": fan_info(),
+        "power": power_state(),
+        "config": load_config(),
+        "model": model_info(),
+    }
+
+
+# --------------------------------------------------------------------------- rgb
+#
+# The AW-ELC lighting controller (187c:0551) is driven the same way the Windows
+# AWCC does it: 33-byte packets sent as USB HID SET_REPORT control transfers
+# (report type Output, report id 2) on interface 0. The kernel's hidraw node
+# cannot be used for this because it treats the first byte as the report id.
+
+import ctypes
+import fcntl
+
+USB_VENDOR, USB_PRODUCT = 0x187C, 0x0551
+ANIMATION_ID = 0x0061  # slot AWCC uses for the keyboard's default animation
+
+USBDEVFS_CONTROL = 0xC0185500        # _IOWR('U', 0, struct usbdevfs_ctrltransfer)
+USBDEVFS_CLAIMINTERFACE = 0x8004550F  # _IOR('U', 15, unsigned int)
+USBDEVFS_RELEASEINTERFACE = 0x80045510
+USBDEVFS_IOCTL = 0xC0105512          # _IOWR('U', 18, struct usbdevfs_ioctl)
+USBDEVFS_DISCONNECT = 0x5516
+USBDEVFS_CONNECT = 0x5517
+
+_libc = ctypes.CDLL(None, use_errno=True)
+
+
+class _CtrlTransfer(ctypes.Structure):
+    _fields_ = [
+        ("bRequestType", ctypes.c_uint8), ("bRequest", ctypes.c_uint8),
+        ("wValue", ctypes.c_uint16), ("wIndex", ctypes.c_uint16),
+        ("wLength", ctypes.c_uint16), ("timeout", ctypes.c_uint32),
+        ("data", ctypes.c_void_p),
+    ]
+
+
+class _IoctlArg(ctypes.Structure):
+    _fields_ = [("ifno", ctypes.c_int), ("ioctl_code", ctypes.c_int), ("data", ctypes.c_void_p)]
+
+
+def find_usb_node():
+    for d in glob.glob("/sys/bus/usb/devices/*"):
+        vid, pid = read(f"{d}/idVendor"), read(f"{d}/idProduct")
+        if vid and pid and int(vid, 16) == USB_VENDOR and int(pid, 16) == USB_PRODUCT:
+            return "/dev/bus/usb/%03d/%03d" % (int(read(f"{d}/busnum")), int(read(f"{d}/devnum")))
+    return None
+
+
+class AlienFX:
+    PREAMBLE = 0x03
+
+    def __init__(self):
+        require_supported("keyboard lighting")
+        path = find_usb_node()
+        if not path:
+            sys.exit("awcc: AW-ELC lighting controller (187c:0551) not found")
+        try:
+            self.fd = os.open(path, os.O_RDWR)
+        except PermissionError:
+            sys.exit(f"awcc: no permission to open {path} (install udev rules: ./install.sh)")
+        # The kernel's HID driver owns interface 0; borrow it while we talk.
+        arg = _IoctlArg(0, USBDEVFS_DISCONNECT, None)
+        _libc.ioctl(self.fd, USBDEVFS_IOCTL, ctypes.byref(arg))
+        iface = ctypes.c_uint(0)
+        if _libc.ioctl(self.fd, USBDEVFS_CLAIMINTERFACE, ctypes.byref(iface)) != 0:
+            err = ctypes.get_errno()
+            self._reattach()
+            os.close(self.fd)
+            sys.exit(f"awcc: cannot claim USB interface: {os.strerror(err)}")
+
+    def _reattach(self):
+        arg = _IoctlArg(0, USBDEVFS_CONNECT, None)
+        _libc.ioctl(self.fd, USBDEVFS_IOCTL, ctypes.byref(arg))
+
+    def close(self):
+        iface = ctypes.c_uint(0)
+        _libc.ioctl(self.fd, USBDEVFS_RELEASEINTERFACE, ctypes.byref(iface))
+        self._reattach()
+        os.close(self.fd)
+
+    def send(self, *data):
+        pkt = bytes(data).ljust(33, b"\x00")[:33]
+        buf = ctypes.create_string_buffer(pkt, 33)
+        xfer = _CtrlTransfer(0x21, 9, 0x0202, 0, 33, 1000, ctypes.cast(buf, ctypes.c_void_p).value)
+        ret = _libc.ioctl(self.fd, USBDEVFS_CONTROL, ctypes.byref(xfer))
+        if ret != 33:
+            raise OSError(ctypes.get_errno(), f"USB control transfer failed ({ret})")
+        time.sleep(0.015)  # the controller drops packets that arrive back to back
+
+    # -- AWCC packet builders
+    def animation(self, command, anim_id):
+        # 1 config start, 2 save, 3 config play, 4 remove, 5 play, 6 set default, 7 set startup
+        self.send(self.PREAMBLE, 0x21, 0x00, command, anim_id >> 8, anim_id & 0xFF)
+
+    def zone_select(self, loop, zones):
+        self.send(self.PREAMBLE, 0x23, loop, len(zones) >> 8, len(zones) & 0xFF, *zones)
+
+    def add_action(self, action, duration, tempo, rgb):
+        r, g, b = rgb
+        self.send(self.PREAMBLE, 0x24, action, duration >> 8, duration & 0xFF,
+                  tempo >> 8, tempo & 0xFF, r, g, b)
+
+    def set_dim(self, dim, zones):
+        self.send(self.PREAMBLE, 0x26, dim, len(zones) >> 8, len(zones) & 0xFF, *zones)
+
+
+def parse_color(text):
+    text = text.strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(c * 2 for c in text)
+    if len(text) != 6:
+        sys.exit(f"awcc: bad color '{text}' (use RRGGBB)")
+    try:
+        return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        sys.exit(f"awcc: bad color '{text}' (use RRGGBB)")
+
+
+def hex_color(rgb):
+    return "#%02x%02x%02x" % rgb
+
+
+SPECTRUM = [(255, 0, 0), (255, 165, 0), (255, 255, 0), (0, 128, 0), (0, 191, 255), (0, 0, 255), (128, 0, 128)]
+
+
+def actions_for(rgb_cfg):
+    """(action, duration, tempo, color) tuples for the selected lighting mode."""
+    mode, color = rgb_cfg["mode"], parse_color(rgb_cfg["color"])
+    speed = max(100, min(10000, int(rgb_cfg.get("speed", 1500))))
+    if mode == "breathe":
+        return [(2, speed // 3, 64, color), (2, speed, 64, color),
+                (2, speed // 3, 64, (0, 0, 0)), (2, speed, 64, (0, 0, 0))]
+    if mode == "spectrum":
+        return [(2, speed, 64, c) for c in SPECTRUM]
+    return [(0, 1, 2, color)]
+
+
+def apply_rgb(cfg, persist=False):
+    """Play the lighting right away through the temporary animation 0.
+
+    With persist=True the same lighting is also saved as the controller's power-up
+    default (animation 0x61, like AWCC). A saved animation is not shown until the next
+    power-up, so the temporary one is what changes the keyboard now."""
+    rgb = cfg["rgb"]
+    dim = 100 - (rgb["brightness"] if rgb["on"] else 0)
+    actions = actions_for(rgb)
+
+    def build(fx, anim_id, finish):
+        fx.animation(1, anim_id)
+        fx.zone_select(1, KEYBOARD_ZONES)
+        for action in actions:
+            fx.add_action(*action)
+        fx.animation(finish, anim_id)
+
+    fx = AlienFX()
+    try:
+        if persist:
+            fx.animation(4, ANIMATION_ID)
+            build(fx, ANIMATION_ID, 2)      # finish and save
+            fx.animation(6, ANIMATION_ID)   # make it the power-up default
+        fx.set_dim(dim, KEYBOARD_ZONES)
+        build(fx, 0, 3)                     # finish and play now
+    finally:
+        fx.close()
+
+
+# --------------------------------------------------------------------------- daemon
+
+def daemon(interval=2.0):
+    m = model_info()
+    if not m["supported"]:
+        print(f"awcc daemon: not started: {m['reason']}", file=sys.stderr)
+        return          # exit code 0: systemd does not restart it
+    cfg = load_config()
+    try:
+        apply_rgb(cfg)
+    except SystemExit as e:
+        print(e, file=sys.stderr)
+    last_ac = None
+    last_mtime = None
+    while True:
+        try:
+            mtime = os.stat(CONFIG_PATH).st_mtime
+        except OSError:
+            mtime = None
+        if mtime != last_mtime:
+            cfg = load_config()
+            last_mtime = mtime
+            last_ac = None  # re-evaluate automatic profile after config edits
+        auto = cfg["auto"]
+        ac = power_state()["ac"]
+        if auto["enabled"] and ac is not None and ac != last_ac and not gmode_active(cfg):
+            target = auto["ac"] if ac else auto["battery"]
+            if get_profile() != target:
+                try:
+                    set_profile(target)
+                except SystemExit as e:
+                    print(e, file=sys.stderr)
+        last_ac = ac
+        time.sleep(interval)
+
+
+# --------------------------------------------------------------------------- cli
+
+def cmd_status(args):
+    data = status()
+    if args.json:
+        print(json.dumps(data))
+        return
+    print(f"Profile: {data['profile']}   (choices: {' '.join(data['profiles'])})")
+    for name, value in data["temps"].items():
+        print(f"{name.upper()} temp: {value} C")
+    for fan in data["fans"]:
+        boost = "?" if fan["boost"] is None else f"{fan['boost']}%"
+        print(f"{fan['label']}: {fan['rpm']} rpm (max {fan['max_rpm']}), boost {boost}")
+    p = data["power"]
+    ac = {True: "AC", False: "battery", None: "unknown"}[p["ac"]]
+    bat = f", battery {p['battery']['percent']}% ({p['battery']['status']})" if p["battery"] else ""
+    print(f"Power: {ac}{bat}")
+
+
+def cmd_profile(args):
+    if args.name:
+        set_profile(args.name)
+    print(get_profile())
+
+
+def gmode_active(cfg):
+    """G mode = fans at max + Performance profile (set by the G key)."""
+    boosts = [f["boost"] or 0 for f in fan_info()]
+    return bool(cfg["gmode"]["active"]) and bool(boosts) and max(boosts) >= 50
+
+
+def cmd_fan(args):
+    if args.which == "toggle":
+        cfg = load_config()
+        boosts = [f["boost"] or 0 for f in fan_info()]
+        if boosts and max(boosts) >= 50:
+            # Changing the profile makes the firmware reset fan boost, so set the profile first.
+            previous = cfg["gmode"]["previous"] if cfg["gmode"]["active"] else None
+            if previous and previous != get_profile():
+                set_profile(previous)
+            set_fan_boost("all", 0)
+            cfg["gmode"] = {"active": False, "previous": None}
+            save_config(cfg)
+            notify("G mode off: fans auto" + (f", profile {previous}" if previous else ""))
+        else:
+            previous = get_profile()
+            if previous != "performance":
+                set_profile("performance")
+            set_fan_boost("all", 100)
+            cfg["gmode"] = {"active": True, "previous": previous}
+            save_config(cfg)
+            notify("G mode: fans MAX, profile performance")
+        return
+    if args.percent is None:
+        for fan in fan_info():
+            print(f"{fan['label']}: boost {fan['boost']}%")
+        return
+    set_fan_boost(args.which, args.percent)
+
+
+def cmd_rgb(args):
+    cfg = load_config()
+    rgb = cfg["rgb"]
+    rgb.pop("zones", None)
+    action = args.rgb_action
+    persist = False
+    if action == "color":
+        rgb["color"] = hex_color(parse_color(args.color))
+        rgb["mode"] = "static"
+        rgb["on"] = True
+    elif action == "mode":
+        rgb["mode"] = args.mode
+        if args.color:
+            rgb["color"] = hex_color(parse_color(args.color))
+        if args.speed:
+            rgb["speed"] = args.speed
+        rgb["on"] = True
+    elif action == "brightness":
+        rgb["brightness"] = max(0, min(100, args.percent))
+        rgb["on"] = rgb["brightness"] > 0 or rgb["on"]
+    elif action == "off":
+        rgb["on"] = False
+    elif action == "on":
+        rgb["on"] = True
+    elif action == "save":
+        persist = True
+    elif action == "profile":
+        return cmd_rgb_profile(args, cfg)
+    elif action == "cycle":
+        level = 0 if (not rgb["on"] or rgb["brightness"] <= 0) else (50 if rgb["brightness"] <= 50 else 100)
+        nxt = {0: 50, 50: 100, 100: 0}[level]
+        rgb["on"] = nxt > 0
+        if nxt:
+            rgb["brightness"] = nxt
+        notify("Keyboard light: " + ("off" if nxt == 0 else f"{nxt}%"))
+    save_config(cfg)
+    apply_rgb(cfg, persist=persist)
+
+
+PROFILE_FIELDS = ("mode", "color", "speed", "brightness")
+
+
+def clean_profile_name(name):
+    name = (name or "").strip()
+    if not name or len(name) > 24 or any(ord(c) < 32 for c in name):
+        sys.exit("awcc: profile name must be 1-24 printable characters")
+    return name
+
+
+def cmd_rgb_profile(args, cfg):
+    profiles = cfg["profiles"]
+    action = args.profile_action
+    if action == "list":
+        for name in sorted(profiles, key=str.lower):
+            p = profiles[name]
+            print(f"{name}: {p.get('mode')} {p.get('color')} brightness {p.get('brightness')}%")
+        return
+    name = clean_profile_name(args.name)
+    if action == "save":
+        profiles[name] = {k: cfg["rgb"][k] for k in PROFILE_FIELDS}
+        save_config(cfg)
+        print(f"saved profile '{name}'")
+    elif action == "delete":
+        if name not in profiles:
+            sys.exit(f"awcc: no profile named '{name}'")
+        del profiles[name]
+        save_config(cfg)
+        print(f"deleted profile '{name}'")
+    elif action == "apply":
+        if name not in profiles:
+            sys.exit(f"awcc: no profile named '{name}'")
+        cfg["rgb"].update({k: v for k, v in profiles[name].items() if k in PROFILE_FIELDS})
+        cfg["rgb"]["on"] = True
+        save_config(cfg)
+        apply_rgb(cfg)
+        print(f"applied profile '{name}'")
+
+
+def cmd_auto(args):
+    cfg = load_config()
+    auto = cfg["auto"]
+    if args.state in ("on", "off"):
+        auto["enabled"] = args.state == "on"
+    if args.ac:
+        auto["ac"] = args.ac
+    if args.battery:
+        auto["battery"] = args.battery
+    save_config(cfg)
+    print(json.dumps(auto))
+
+
+def key_bit(capabilities_key, bit):
+    """Is evdev key `bit` set in a /sys/class/input/inputN/capabilities/key bitmap (hex words, most significant first)?"""
+    words = capabilities_key.split()
+    width = ctypes.sizeof(ctypes.c_ulong) * 8
+    idx = bit // width
+    return idx < len(words) and (int(words[-1 - idx], 16) >> (bit % width)) & 1 == 1
+
+
+def keyboard_has(bit):
+    for d in glob.glob("/sys/class/input/input*"):
+        if read(f"{d}/name") == "AT Translated Set 2 keyboard":
+            caps = read(f"{d}/capabilities/key")
+            if caps is not None:
+                return key_bit(caps, bit)
+    return None
+
+
+def binding_files():
+    base = os.path.expanduser("~/.config/hypr")
+    return [os.path.join(base, f) for f in ("bindings.lua", "bindings.conf", "hyprland.lua", "hyprland.conf") if os.path.exists(os.path.join(base, f))]
+
+
+def has_binding(evdev):
+    code = f"code:{evdev + 8}"
+    for f in binding_files():
+        try:
+            for line in open(f):
+                if code in line and "awcc" in line and not line.lstrip().startswith(("--", "#")):
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def cmd_doctor(args):
+    """Read-only check of everything this package depends on, as a report you can paste into a bug report."""
+    rows = []   # (level, label, detail)  level: ok / warn / fail / info
+
+    def add(level, label, detail=""):
+        rows.append({"level": level, "label": label, "detail": detail})
+
+    m = model_info()
+    add("info", "Machine", f"{dmi('sys_vendor')} / {dmi('product_name')} / board {dmi('board_name')} / BIOS {dmi('bios_version')}")
+    if m["verified"]:
+        add("ok", "Model", f"{m['name']} is verified")
+    elif m["supported"]:
+        add("warn", "Model", f"{m['name']}: unverified, writes allowed by you")
+    else:
+        add("fail", "Model", m["reason"])
+    add("info", "Kernel", read("/proc/sys/kernel/osrelease", "?"))
+
+    hw = hwmon_dir("alienware_wmi")
+    if not hw:
+        add("fail", "alienware_wmi hwmon", "not found (kernel driver alienware-wmi missing?)")
+    else:
+        add("ok", "alienware_wmi hwmon", hw)
+        add("ok" if fan_layout_ok() else "fail", "Fan layout", "CPU Fan + GPU Fan" if fan_layout_ok() else
+            f"expected CPU Fan + GPU Fan, found {read(hw + '/fan1_label')!r} / {read(hw + '/fan2_label')!r}")
+        for n in (1, 2):
+            f = f"{hw}/fan{n}_boost"
+            add("ok" if os.access(f, os.W_OK) else "fail", f"fan{n}_boost writable", f if os.access(f, os.W_OK) else f"{f} not writable (udev rules not installed?)")
+    devs = profile_devices()
+    if not devs:
+        add("fail", "Thermal profile", "no platform-profile driver found")
+    for name, d in devs.items():
+        ok = os.access(f"{d}/profile", os.W_OK)
+        add("ok" if ok else "fail", f"Profile {name} writable", f"{read(d + '/profile')} (choices: {read(d + '/choices')})" if ok else "not writable (udev rules not installed?)")
+
+    node = find_usb_node()
+    if not node:
+        add("fail", "Keyboard lighting controller", "USB 187c:0551 not found")
+    else:
+        ok = os.access(node, os.R_OK | os.W_OK)
+        add("ok" if ok else "fail", "Keyboard lighting controller", f"187c:0551 at {node}" + ("" if ok else " - no permission (udev rules not installed?)"))
+
+    add("ok" if os.path.exists("/etc/udev/rules.d/70-awcc.rules") else "warn", "udev rules", "/etc/udev/rules.d/70-awcc.rules"
+        if os.path.exists("/etc/udev/rules.d/70-awcc.rules") else "not installed (run ./install.sh)")
+    svc = subprocess.run(["systemctl", "--user", "is-active", "awcc.service"], capture_output=True, text=True).stdout.strip() or "unknown"
+    add("ok" if svc == "active" else "warn", "User service awcc.service", svc)
+
+    for label, evdev, cmd in (("F7 light key", KEY_LIGHT_EVDEV, "awcc rgb cycle"), ("G key", KEY_G_EVDEV, "awcc fan toggle")):
+        has = keyboard_has(evdev)
+        if has is None:
+            add("warn", label, "keyboard 'AT Translated Set 2 keyboard' not found")
+        elif not has:
+            add("warn", label, f"this keyboard does not report evdev {evdev}: the key may behave differently on this G16")
+        else:
+            bound = has_binding(evdev)
+            add("ok" if bound else "info", label, f"present (Hyprland code:{evdev + 8})" + ("" if bound else f", not bound: bind code:{evdev + 8} to `{cmd}`"))
+
+    fails = [r for r in rows if r["level"] == "fail"]
+    if args.json:
+        print(json.dumps({"model": m, "ok": not fails, "checks": rows}))
+    else:
+        tag = {"ok": "[ ok ]", "warn": "[warn]", "fail": "[FAIL]", "info": "[info]"}
+        for r in rows:
+            print(f"{tag[r['level']]} {r['label']}" + (f": {r['detail']}" if r["detail"] else ""))
+        print("\nResult: " + ("READY" if not fails else f"{len(fails)} problem(s) - paste this report into an issue"))
+    sys.exit(1 if fails else 0)
+
+
+def cmd_allow_unverified(args):
+    cfg = load_config()
+    if args.state:
+        cfg["safety"]["allow_unverified"] = args.state == "on"
+        save_config(cfg)
+    print("allow-unverified: " + ("on" if cfg["safety"]["allow_unverified"] else "off") + f"   (model: {model_info()['name']})")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="awcc", description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("status", help="show profile, temperatures, fans and power")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("profile", help="get or set the thermal profile")
+    s.add_argument("name", nargs="?")
+    s.set_defaults(fn=cmd_profile)
+
+    s = sub.add_parser("fan", help="get or set fan boost (0-100), or `fan toggle` for auto <-> max")
+    s.add_argument("which", nargs="?", choices=["cpu", "gpu", "all", "toggle"], default="all")
+    s.add_argument("percent", nargs="?", type=int)
+    s.set_defaults(fn=cmd_fan)
+
+    s = sub.add_parser("rgb", help="keyboard lighting")
+    rs = s.add_subparsers(dest="rgb_action", required=True)
+    c = rs.add_parser("color", help="static color")
+    c.add_argument("color", help="RRGGBB")
+    mo = rs.add_parser("mode", help="static, breathe or spectrum")
+    mo.add_argument("mode", choices=RGB_MODES)
+    mo.add_argument("--color", help="RRGGBB (static and breathe)")
+    mo.add_argument("--speed", type=int, help="milliseconds per step (100-10000)")
+    b = rs.add_parser("brightness", help="0-100")
+    b.add_argument("percent", type=int)
+    rs.add_parser("on")
+    rs.add_parser("off")
+    rs.add_parser("restore", help="re-apply saved lighting")
+    rs.add_parser("save", help="also store as the controller's power-up default")
+    rs.add_parser("cycle", help="cycle off, 50%%, 100%%")
+    pr = rs.add_parser("profile", help="saved lighting profiles: save | apply | delete | list")
+    pr.add_argument("profile_action", choices=["save", "apply", "delete", "list"])
+    pr.add_argument("name", nargs="?")
+    s.set_defaults(fn=cmd_rgb)
+
+    s = sub.add_parser("auto", help="automatic profile on AC / battery")
+    s.add_argument("state", nargs="?", choices=["on", "off"])
+    s.add_argument("--ac")
+    s.add_argument("--battery")
+    s.set_defaults(fn=cmd_auto)
+
+    s = sub.add_parser("doctor", help="read-only check of the model, kernel interfaces, permissions, service and hardware keys")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("allow-unverified", help="allow hardware writes on a G16 revision that is not the verified one")
+    s.add_argument("state", nargs="?", choices=["on", "off"])
+    s.set_defaults(fn=cmd_allow_unverified)
+
+    s = sub.add_parser("daemon", help="restore lighting and switch profiles on power changes")
+    s.set_defaults(fn=lambda a: daemon())
+
+    args = p.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

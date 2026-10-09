@@ -1,0 +1,11 @@
+[Unit]
+Description=AWCC alternative: restore keyboard lighting, switch profiles on AC/battery
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/awcc daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

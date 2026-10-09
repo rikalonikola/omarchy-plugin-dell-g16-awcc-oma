@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.rikalonikola.dell-g16-awcc-oma",
+  "name": "Dell G16 AWCC-Oma",
+  "version": "1.0.0",
+  "author": "rikalonikola",
+  "license": "MIT",
+  "description": "Alienware Command Center alternative made for the Dell G16: thermal profiles, fan boost, keyboard lighting and sensors, with the F7 light key and the G key. Checks the laptop model before it writes to any hardware. Needs the bundled awcc CLI.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "G16 AWCC-Oma",
+    "description": "Dell G16 thermal profile, fan boost, keyboard lighting and temperatures.",
+    "category": "Hardware",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

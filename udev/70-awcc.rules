@@ -1,0 +1,10 @@
+# Dell G16 AWCC-Oma: unprivileged access for the logged-in user.
+
+# RGB lighting controller (AW-ELC). AWCC talks to it with raw USB control transfers.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="187c", ATTRS{idProduct}=="0551", MODE="0660", TAG+="uaccess"
+
+# Thermal profiles (alienware-wmi, dell-pc) writable by the wheel group
+SUBSYSTEM=="platform-profile", ACTION=="add|change", RUN+="/usr/bin/chgrp wheel /sys%p/profile", RUN+="/usr/bin/chmod g+w /sys%p/profile"
+
+# Fan boost (alienware_wmi hwmon) writable by the wheel group
+SUBSYSTEM=="hwmon", ATTR{name}=="alienware_wmi", ACTION=="add|change", RUN+="/bin/sh -c 'chgrp wheel /sys%p/fan*_boost; chmod g+w /sys%p/fan*_boost'"
